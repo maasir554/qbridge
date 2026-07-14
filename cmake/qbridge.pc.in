@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: QBridge
+Description: Portable USB/IP client and QEMU transport engine
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lqbridge
+Cflags: -I${includedir}
+

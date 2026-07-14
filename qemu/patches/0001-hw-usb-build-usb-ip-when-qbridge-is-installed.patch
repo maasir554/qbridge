@@ -1,0 +1,24 @@
+From: QBridge contributors
+Subject: [PATCH] hw/usb: build USB/IP pass-through device with QBridge
+
+Copy qemu/hw/usb/dev-usbip.c from the QBridge tree to hw/usb/dev-usbip.c,
+then apply this patch from the QEMU source root.
+
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -86,6 +86,14 @@ if libusb.found()
+   usbhost_ss.add(when: ['CONFIG_USB', libusb],
+                  if_true: files('host-libusb.c'))
+   hw_usb_modules += {'host': usbhost_ss}
+ endif
++
++# USB/IP pass-through.  QBridge is intentionally optional so normal QEMU
++# builds are unchanged when the library is not installed.
++qbridge = dependency('qbridge', required: false)
++if qbridge.found()
++  system_ss.add(when: 'CONFIG_USB',
++                if_true: [qbridge, files('dev-usbip.c')])
++endif
+ 
+ system_ss.add(when: ['CONFIG_USB', 'CONFIG_XEN_BUS', libusb], if_true: files('xen-usb.c'))
