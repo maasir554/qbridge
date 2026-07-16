@@ -1,4 +1,7 @@
 @echo off
+set "SYSTEM_DISK_DEVICE=-device nvme,drive=disk0,serial=QBRIDGE-NVME-001,bootindex=1"
+if /I "%~1"=="--sata" set "SYSTEM_DISK_DEVICE=-device ide-hd,drive=disk0,bus=sata.0"
+
 tasklist /FI "IMAGENAME eq qemu-system-x86_64-qbridge-media-v9.exe" 2>NUL | find /I "qemu-system-x86_64-qbridge-media-v9.exe" >NUL
 if not errorlevel 1 (
   echo The QBridge media VM is already running.
@@ -27,7 +30,7 @@ if errorlevel 1 (
 -machine q35,accel=whpx ^
 -cpu Skylake-Client-v4 ^
 -m 8G ^
--smp 4 ^
+-smp 6,sockets=1,cores=6,threads=1 ^
 -smbios type=0,vendor="American Megatrends International",version="K3605ZF.316" ^
 -smbios type=1,manufacturer="ASUSTeK COMPUTER INC.",product="Vivobook_ASUSLaptop K3605ZF_K3605ZF",version="1.0" ^
 -smbios type=2,manufacturer="ASUSTeK COMPUTER INC.",product="K3605ZF",version="1.0" ^
@@ -35,7 +38,7 @@ if errorlevel 1 (
 -drive if=pflash,format=raw,file="E:\QEMU\firmware\OVMF_VARS.fd" ^
 -device ich9-ahci,id=sata ^
 -drive id=disk0,if=none,file="E:\QEMU\images\windows11.qcow2",format=qcow2 ^
--device ide-hd,drive=disk0,bus=sata.0 ^
+%SYSTEM_DISK_DEVICE% ^
 -drive id=virtio,if=none,media=cdrom,file="E:\QEMU\iso\virtio-win.iso" ^
 -device ide-cd,drive=virtio,bus=sata.2 ^
 -netdev user,id=net0 ^
