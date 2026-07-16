@@ -40,6 +40,9 @@ if errorlevel 1 (
 -device ide-cd,drive=virtio,bus=sata.2 ^
 -netdev user,id=net0 ^
 -device e1000e,netdev=net0 ^
+-audiodev dsound,id=hostaudio ^
+-device ich9-intel-hda,id=hda ^
+-device hda-micro,bus=hda.0,audiodev=hostaudio ^
 -device qemu-xhci,id=xhci ^
 -device usb-qbridge-camera,bus=xhci.0 ^
 -display gtk ^
