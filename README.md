@@ -65,7 +65,7 @@ Then use a QEMU build containing the adapter:
 ```powershell
 qemu-system-x86_64.exe `
   -device qemu-xhci,id=xhci `
-  -device usb-ip,bus=xhci.0,host=127.0.0.1,port=3240,busid=1-7
+  -device usb-ip,bus=xhci.0,host=127.0.0.1,tcp-port=3240,busid=1-7
 ```
 
 Optional policy example:

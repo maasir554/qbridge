@@ -104,7 +104,7 @@ make_submit(std::uint32_t seqnum, std::uint32_t devid,
     put_u32(result.data() + 32,
             transfer.type == QB_TRANSFER_ISOCHRONOUS
                 ? transfer.iso_packet_count
-                : std::numeric_limits<std::uint32_t>::max());
+                : 0);
     put_u32(result.data() + 36, transfer.interval);
     if (transfer.type == QB_TRANSFER_CONTROL) {
         std::memcpy(result.data() + 40, transfer.setup, 8);

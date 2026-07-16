@@ -36,7 +36,7 @@ void test_protocol() {
     CHECK(qb::wire::get_u32(submit.data() + 8) == 0x0001000f);
     CHECK(qb::wire::get_u32(submit.data() + 12) == QB_DIR_IN);
     CHECK(qb::wire::get_u32(submit.data() + 24) == 18);
-    CHECK(qb::wire::get_u32(submit.data() + 32) == 0xffffffffu);
+    CHECK(qb::wire::get_u32(submit.data() + 32) == 0);
     CHECK(std::memcmp(submit.data() + 40, setup, 8) == 0);
 
     const auto unlink = qb::wire::make_unlink(8, 0x0001000f, 7);

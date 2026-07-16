@@ -8,6 +8,7 @@
 #include "qom/object.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/thread.h"
@@ -22,6 +23,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(USBIPDevice, USB_IP_DEVICE)
 
 #define USBIP_URB_SHORT_NOT_OK 0x00000001u
 #define USBIP_URB_ISO_ASAP     0x00000002u
+#define USBIP_ISO_URBS         16
+#define USBIP_ISO_FRAMES       32
+#define USBIP_UVC_MAX_PAYLOAD  1020u
+#define USBIP_UVC_SAFE_MAX_FRAME_SIZE 614400u
 
 typedef struct USBIPRequest USBIPRequest;
 
@@ -29,12 +34,12 @@ struct USBIPDevice {
     USBDevice parent_obj;
     char *host;
     char *busid;
-    char *serial;
     uint16_t port;
     uint32_t vendor_id;
     uint32_t product_id;
     uint32_t connect_timeout_ms;
     uint32_t reconnect_delay_ms;
+    uint8_t uvc_safe_frame;
     bool allow_remote;
     bool reconnect;
     bool wait;
@@ -46,6 +51,7 @@ struct USBIPDevice {
     bool closing;
     bool remote_connected;
     qb_result connection_reason;
+    uint64_t iso_completion_serial;
     uint8_t interval[2][USB_MAX_ENDPOINTS + 1];
 };
 
@@ -53,7 +59,7 @@ struct USBIPRequest {
     USBIPDevice *owner;
     USBPacket *packet;
     qb_transfer transfer;
-    qb_iso_packet iso;
+    qb_iso_packet iso[USBIP_ISO_FRAMES];
     qb_completion completion;
     uint8_t *buffer;
     uint8_t *control_data;
@@ -61,7 +67,10 @@ struct USBIPRequest {
     int value;
     int index;
     bool control;
+    bool iso_prefetch;
     bool completed;
+    uint32_t iso_next;
+    uint64_t iso_completion_serial;
     uint32_t id;
     QEMUBH *bh;
     QTAILQ_ENTRY(USBIPRequest) next;
@@ -98,6 +107,81 @@ static int usb_ip_speed(qb_speed speed)
     }
 }
 
+static void usb_ip_quirk_uvc_payload(USBIPRequest *r)
+{
+    uint32_t payload;
+
+    /*
+     * usbipd-win's Windows USB/IP server returns zero-filled data for this
+     * USB 2 webcam when UVC selects a high-bandwidth isochronous alternate
+     * setting (multiple transactions per microframe).  Cap the UVC
+     * VS_PROBE/VS_COMMIT payload advertised to the guest so Windows selects
+     * the single-transaction 1020-byte alternate setting instead.
+     */
+    if (!r->control || r->transfer.direction != QB_DIR_IN ||
+        (r->request >> 8) != 0xa1 ||
+        (r->request & 0xff) < 0x81 || (r->request & 0xff) > 0x87 ||
+        (r->value >> 8) < 1 || (r->value >> 8) > 2 ||
+        r->completion.actual_length < 26) {
+        return;
+    }
+    payload = r->buffer[22] | (r->buffer[23] << 8) |
+              (r->buffer[24] << 16) | (r->buffer[25] << 24);
+    if (payload <= USBIP_UVC_MAX_PAYLOAD) {
+        return;
+    }
+    r->buffer[22] = USBIP_UVC_MAX_PAYLOAD & 0xff;
+    r->buffer[23] = (USBIP_UVC_MAX_PAYLOAD >> 8) & 0xff;
+    r->buffer[24] = 0;
+    r->buffer[25] = 0;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "usb-ip %s: capped UVC payload from %u to %u bytes\n",
+                  r->owner->busid, payload, USBIP_UVC_MAX_PAYLOAD);
+}
+
+static void usb_ip_quirk_uvc_control_out(USBIPRequest *r)
+{
+    USBIPDevice *s = r->owner;
+    uint32_t max_frame_size;
+    uint32_t payload;
+
+    /*
+     * usbipd-win's user-mode USB/IP path cannot sustain this camera's first
+     * MJPEG frame descriptor (1280x720) over its USB 2 connection.  UVC probe
+     * negotiation explicitly allows the device to adjust the requested frame.
+     * Redirect only that high-bandwidth request to a configured physical frame
+     * descriptor; lower resolutions remain untouched.
+     */
+    if (!s->uvc_safe_frame || !r->control ||
+        r->transfer.direction != QB_DIR_OUT ||
+        r->request != 0x2101 || r->transfer.length < 26 ||
+        (r->value >> 8) < 1 || (r->value >> 8) > 2 ||
+        r->buffer[2] != 1 || r->buffer[3] != 1) {
+        return;
+    }
+
+    r->buffer[3] = s->uvc_safe_frame;
+    max_frame_size = USBIP_UVC_SAFE_MAX_FRAME_SIZE;
+    r->buffer[18] = max_frame_size;
+    r->buffer[19] = max_frame_size >> 8;
+    r->buffer[20] = max_frame_size >> 16;
+    r->buffer[21] = max_frame_size >> 24;
+
+    payload = r->buffer[22] | (r->buffer[23] << 8) |
+              (r->buffer[24] << 16) | (r->buffer[25] << 24);
+    if (payload > USBIP_UVC_MAX_PAYLOAD) {
+        r->buffer[22] = USBIP_UVC_MAX_PAYLOAD & 0xff;
+        r->buffer[23] = (USBIP_UVC_MAX_PAYLOAD >> 8) & 0xff;
+        r->buffer[24] = 0;
+        r->buffer[25] = 0;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "usb-ip %s: changed UVC MJPEG frame 1 to physical frame %u "
+                  "for USB/IP-safe capture\n",
+                  s->busid, s->uvc_safe_frame);
+}
+
 static const uint8_t *usb_ip_find_config(USBIPDevice *s, uint8_t value,
                                          size_t *length)
 {
@@ -115,6 +199,59 @@ static const uint8_t *usb_ip_find_config(USBIPDevice *s, uint8_t value,
         }
     }
     return NULL;
+}
+
+static bool usb_ip_string_descriptor(const qb_descriptor_cache *cache,
+                                     uint8_t index, uint8_t *data,
+                                     size_t requested, size_t *actual)
+{
+    const char *text = NULL;
+    gunichar2 *utf16;
+    glong units = 0;
+    size_t total;
+    size_t i;
+
+    if (index == 0) {
+        static const uint8_t languages[] = {
+            4, USB_DT_STRING, 0x09, 0x04
+        };
+
+        *actual = MIN(requested, sizeof(languages));
+        memcpy(data, languages, *actual);
+        return true;
+    }
+    if (!cache->device || cache->device_length < 17) {
+        return false;
+    }
+    if (index == cache->device[14]) {
+        text = cache->manufacturer;
+    } else if (index == cache->device[15]) {
+        text = cache->product;
+    } else if (index == cache->device[16]) {
+        text = cache->serial;
+    } else {
+        return false;
+    }
+
+    utf16 = g_utf8_to_utf16(text ? text : "", -1, NULL, &units, NULL);
+    if (!utf16) {
+        units = 0;
+    }
+    units = MIN(units, 126);
+    total = 2 + (size_t)units * 2;
+    if (requested > 0) {
+        data[0] = total;
+    }
+    if (requested > 1) {
+        data[1] = USB_DT_STRING;
+    }
+    for (i = 0; i < (size_t)units && 2 + i * 2 + 1 < requested; ++i) {
+        data[2 + i * 2] = utf16[i] & 0xff;
+        data[3 + i * 2] = utf16[i] >> 8;
+    }
+    g_free(utf16);
+    *actual = MIN(requested, total);
+    return true;
 }
 
 static void usb_ip_update_endpoints(USBIPDevice *s)
@@ -187,14 +324,30 @@ static void usb_ip_apply_control_state(USBIPRequest *r)
 {
     USBIPDevice *s = r->owner;
     USBDevice *dev = USB_DEVICE(s);
+    const uint8_t *config;
+    size_t config_length;
 
     if (r->completion.status != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "usb-ip %s: control failed status=%d "
+                      "request=%02x:%02x value=%04x index=%04x length=%u\n",
+                      s->busid, r->completion.status,
+                      r->request >> 8, r->request & 0xff,
+                      r->value, r->index, r->transfer.length);
         return;
     }
     switch (r->request) {
     case DeviceOutRequest | USB_REQ_SET_CONFIGURATION:
         dev->configuration = r->value & 0xff;
         memset(dev->altsetting, 0, sizeof(dev->altsetting));
+        dev->ninterfaces = 0;
+        if (dev->configuration) {
+            config = usb_ip_find_config(s, dev->configuration,
+                                        &config_length);
+            if (config && config_length >= 9) {
+                dev->ninterfaces = MIN(config[4], USB_MAX_INTERFACES);
+            }
+        }
         usb_ip_update_endpoints(s);
         break;
     case InterfaceOutRequest | USB_REQ_SET_INTERFACE:
@@ -225,6 +378,7 @@ static void usb_ip_request_bh(void *opaque)
     qemu_mutex_unlock(&s->lock);
 
     if (packet) {
+        usb_ip_quirk_uvc_payload(r);
         packet->status = usb_ip_status(r->completion.status);
         packet->actual_length = 0;
         if (packet->status == USB_RET_SUCCESS &&
@@ -261,7 +415,10 @@ static void usb_ip_completion(qb_session *session,
     qemu_mutex_lock(&s->lock);
     r->completion = *completion;
     r->completed = true;
-    if (!s->closing) {
+    if (r->iso_prefetch) {
+        r->iso_completion_serial = ++s->iso_completion_serial;
+    }
+    if (!s->closing && !r->iso_prefetch) {
         qemu_bh_schedule(r->bh);
     }
     qemu_mutex_unlock(&s->lock);
@@ -349,6 +506,110 @@ static void usb_ip_submit(USBIPRequest *r, USBPacket *packet)
     g_free(r);
 }
 
+static void usb_ip_iso_prefetch(USBIPDevice *s, USBEndpoint *ep,
+                                unsigned dir, size_t length)
+{
+    USBIPRequest *r;
+    unsigned pending = 0;
+    unsigned i;
+    qb_result result;
+
+    qemu_mutex_lock(&s->lock);
+    QTAILQ_FOREACH(r, &s->requests, next) {
+        if (r->iso_prefetch &&
+            r->transfer.endpoint == ep->nr &&
+            r->transfer.direction == dir) {
+            pending++;
+        }
+    }
+    qemu_mutex_unlock(&s->lock);
+
+    while (pending++ < USBIP_ISO_URBS) {
+        r = usb_ip_request_new(s, NULL, length * USBIP_ISO_FRAMES, false);
+        r->iso_prefetch = true;
+        r->transfer.type = QB_TRANSFER_ISOCHRONOUS;
+        r->transfer.direction = dir;
+        r->transfer.endpoint = ep->nr;
+        r->transfer.interval = s->interval[dir][ep->nr];
+        r->transfer.flags = USBIP_URB_ISO_ASAP;
+        /*
+         * ISO_ASAP makes the host schedule the URB at the next available
+         * frame.  Linux VHCI sends a zero start_frame in this mode; using -1
+         * causes the Windows USB/IP host controller to return UVC error
+         * payloads on this camera.
+         */
+        r->transfer.start_frame = 0;
+        for (i = 0; i < USBIP_ISO_FRAMES; ++i) {
+            r->iso[i].offset = i * length;
+            r->iso[i].length = length;
+        }
+        r->transfer.iso_packets = r->iso;
+        r->transfer.iso_packet_count = USBIP_ISO_FRAMES;
+        result = qb_session_submit(s->session, &r->transfer, &r->id);
+        if (result == QB_OK) {
+            continue;
+        }
+        qemu_mutex_lock(&s->lock);
+        QTAILQ_REMOVE(&s->requests, r, next);
+        qemu_mutex_unlock(&s->lock);
+        qemu_bh_delete(r->bh);
+        g_free(r->buffer);
+        g_free(r);
+        break;
+    }
+}
+
+static void usb_ip_handle_iso_in(USBIPDevice *s, USBPacket *packet,
+                                 size_t length)
+{
+    USBIPRequest *r = NULL;
+    USBIPRequest *candidate;
+    const unsigned dir = QB_DIR_IN;
+    qb_iso_packet *iso = NULL;
+    bool finished = false;
+    size_t actual;
+
+    qemu_mutex_lock(&s->lock);
+    QTAILQ_FOREACH(candidate, &s->requests, next) {
+        if (candidate->iso_prefetch && candidate->completed &&
+            candidate->transfer.endpoint == packet->ep->nr &&
+            candidate->transfer.direction == dir &&
+            (!r || candidate->iso_completion_serial <
+                   r->iso_completion_serial)) {
+            r = candidate;
+        }
+    }
+    if (r) {
+        iso = &r->iso[r->iso_next++];
+        finished = r->iso_next == r->transfer.iso_packet_count;
+        if (finished) {
+            QTAILQ_REMOVE(&s->requests, r, next);
+        }
+    }
+    qemu_mutex_unlock(&s->lock);
+
+    packet->status = USB_RET_SUCCESS;
+    packet->actual_length = 0;
+    if (r) {
+        packet->status = usb_ip_status(r->completion.status);
+        if (packet->status == USB_RET_SUCCESS && iso->status != 0) {
+            packet->status = usb_ip_status(iso->status);
+        }
+        if (packet->status == USB_RET_SUCCESS) {
+            actual = MIN(length, (size_t)iso->actual_length);
+            if (actual) {
+                usb_packet_copy(packet, r->buffer + iso->offset, actual);
+            }
+        }
+        if (finished) {
+            qemu_bh_delete(r->bh);
+            g_free(r->buffer);
+            g_free(r);
+        }
+    }
+    usb_ip_iso_prefetch(s, packet->ep, dir, length);
+}
+
 static void usb_ip_handle_control(USBDevice *dev, USBPacket *packet,
                                   int request, int value, int index,
                                   int length, uint8_t *data)
@@ -361,8 +622,51 @@ static void usb_ip_handle_control(USBDevice *dev, USBPacket *packet,
         return;
     }
     if (request == (DeviceOutRequest | USB_REQ_SET_ADDRESS)) {
+        dev->addr = value & 0x7f;
         packet->status = USB_RET_SUCCESS;
         return;
+    }
+    if (request == (DeviceRequest | USB_REQ_GET_DESCRIPTOR)) {
+        const qb_descriptor_cache *cache = qb_session_descriptors(s->session);
+        const uint8_t type = value >> 8;
+        const uint8_t descriptor_index = value & 0xff;
+        const uint8_t *descriptor = NULL;
+        size_t descriptor_length = 0;
+
+        if (type == USB_DT_DEVICE && descriptor_index == 0) {
+            descriptor = cache->device;
+            descriptor_length = cache->device_length;
+        } else if (type == USB_DT_CONFIG &&
+                   qb_session_configuration(s->session, descriptor_index,
+                                            &descriptor,
+                                            &descriptor_length) != QB_OK) {
+            descriptor = NULL;
+            descriptor_length = 0;
+        } else if (type == USB_DT_BOS && descriptor_index == 0) {
+            /*
+             * The physical webcam advertises bcdUSB 2.01.  Windows therefore
+             * requests the USB 2.0 Extension capability before completing
+             * enumeration, but usbipd-win stalls the physical BOS request.
+             */
+            static const uint8_t bos[] = {
+                5, USB_DT_BOS, 12, 0, 1,
+                7, USB_DT_DEVICE_CAPABILITY, 2, 2, 0, 0, 0
+            };
+            descriptor = bos;
+            descriptor_length = sizeof(bos);
+        } else if (type == USB_DT_STRING &&
+                   usb_ip_string_descriptor(cache, descriptor_index, data,
+                                            length, &descriptor_length)) {
+            packet->actual_length = descriptor_length;
+            packet->status = USB_RET_SUCCESS;
+            return;
+        }
+        if (descriptor) {
+            packet->actual_length = MIN((size_t)length, descriptor_length);
+            memcpy(data, descriptor, packet->actual_length);
+            packet->status = USB_RET_SUCCESS;
+            return;
+        }
     }
     r = usb_ip_request_new(s, packet, length, true);
     r->request = request;
@@ -381,6 +685,7 @@ static void usb_ip_handle_control(USBDevice *dev, USBPacket *packet,
     r->transfer.setup[7] = length >> 8;
     if (r->transfer.direction == QB_DIR_OUT && length) {
         memcpy(r->buffer, data, length);
+        usb_ip_quirk_uvc_control_out(r);
     }
     usb_ip_submit(r, packet);
 }
@@ -405,6 +710,20 @@ static void usb_ip_handle_data(USBDevice *dev, USBPacket *packet)
         packet->status = USB_RET_STALL;
         return;
     }
+    if (type == USB_ENDPOINT_XFER_ISOC && dir) {
+        usb_ip_handle_iso_in(s, packet, length);
+        return;
+    }
+    if (type == USB_ENDPOINT_XFER_ISOC) {
+        /*
+         * QEMU host controllers require isochronous packets to complete
+         * synchronously.  This device currently only redirects capture
+         * endpoints; do not return ASYNC for an unexpected playback stream.
+         */
+        packet->status = USB_RET_SUCCESS;
+        packet->actual_length = length;
+        return;
+    }
     r = usb_ip_request_new(s, packet, length, false);
     r->transfer.type = type;
     r->transfer.direction = dir ? QB_DIR_IN : QB_DIR_OUT;
@@ -415,9 +734,9 @@ static void usb_ip_handle_data(USBDevice *dev, USBPacket *packet)
     }
     if (type == USB_ENDPOINT_XFER_ISOC) {
         r->transfer.flags |= USBIP_URB_ISO_ASAP;
-        r->transfer.start_frame = -1;
-        r->iso.length = length;
-        r->transfer.iso_packets = &r->iso;
+        r->transfer.start_frame = 0;
+        r->iso[0].length = length;
+        r->transfer.iso_packets = r->iso;
         r->transfer.iso_packet_count = 1;
     }
     if (!dir && length) {
@@ -460,6 +779,7 @@ static void usb_ip_handle_reset(USBDevice *dev)
     }
     qemu_mutex_unlock(&s->lock);
     dev->configuration = 0;
+    dev->ninterfaces = 0;
     memset(dev->altsetting, 0, sizeof(dev->altsetting));
     usb_ip_update_endpoints(s);
 }
@@ -471,7 +791,6 @@ static void usb_ip_realize(USBDevice *dev, Error **errp)
     const qb_device_info *info;
     const qb_descriptor_cache *descriptors;
     qb_result result;
-    Error *local_err = NULL;
 
     if (!s->busid || !s->busid[0]) {
         error_setg(errp, "usb-ip requires busid");
@@ -491,7 +810,7 @@ static void usb_ip_realize(USBDevice *dev, Error **errp)
     config.policy.allow_remote = s->allow_remote;
     config.policy.vendor_id = s->vendor_id;
     config.policy.product_id = s->product_id;
-    config.policy.serial = s->serial;
+    config.policy.serial = dev->serial;
     result = qb_session_open(&config, usb_ip_completion, usb_ip_connection,
                              s, &s->session);
     if (result != QB_OK) {
@@ -500,7 +819,6 @@ static void usb_ip_realize(USBDevice *dev, Error **errp)
         return;
     }
     dev->flags |= 1 << USB_DEV_FLAG_IS_HOST;
-    dev->auto_attach = 0;
     s->remote_connected = qb_session_connected(s->session);
     if (s->remote_connected) {
         info = qb_session_device(s->session);
@@ -510,12 +828,8 @@ static void usb_ip_realize(USBDevice *dev, Error **errp)
         g_strlcpy(dev->product_desc,
                   descriptors->product[0] ? descriptors->product : "USB/IP device",
                   sizeof(dev->product_desc));
-        usb_device_attach(dev, &local_err);
-        if (local_err) {
-            qb_session_close(s->session);
-            s->session = NULL;
-            error_propagate(errp, local_err);
-        }
+    } else {
+        dev->auto_attach = 0;
     }
 }
 
@@ -559,7 +873,7 @@ static void usb_ip_instance_finalize(Object *obj)
 
 static const Property usb_ip_properties[] = {
     DEFINE_PROP_STRING("host", USBIPDevice, host),
-    DEFINE_PROP_UINT16("port", USBIPDevice, port, QB_USBIP_DEFAULT_PORT),
+    DEFINE_PROP_UINT16("tcp-port", USBIPDevice, port, QB_USBIP_DEFAULT_PORT),
     DEFINE_PROP_STRING("busid", USBIPDevice, busid),
     DEFINE_PROP_BOOL("allow-remote", USBIPDevice, allow_remote, false),
     DEFINE_PROP_BOOL("reconnect", USBIPDevice, reconnect, true),
@@ -568,7 +882,7 @@ static const Property usb_ip_properties[] = {
     DEFINE_PROP_UINT32("connect-timeout", USBIPDevice, connect_timeout_ms, 5000),
     DEFINE_PROP_UINT32("vendorid", USBIPDevice, vendor_id, 0),
     DEFINE_PROP_UINT32("productid", USBIPDevice, product_id, 0),
-    DEFINE_PROP_STRING("serial", USBIPDevice, serial),
+    DEFINE_PROP_UINT8("uvc-safe-frame", USBIPDevice, uvc_safe_frame, 0),
 };
 
 static const VMStateDescription vmstate_usb_ip = {

@@ -45,6 +45,13 @@ if(QBRIDGE_BUILD_CLI)
   add_executable(qbridge-cli cli/main.cpp)
   target_link_libraries(qbridge-cli PRIVATE QBridge::qbridge)
   set_target_properties(qbridge-cli PROPERTIES OUTPUT_NAME qbridge)
+  if(WIN32)
+    add_executable(qbridge-media cli/media.cpp)
+    target_include_directories(qbridge-media PRIVATE include)
+    target_link_libraries(qbridge-media PRIVATE
+      mf mfplat mfreadwrite mfuuid ole32 uuid
+    )
+  endif()
 endif()
 
 include(CTest)
@@ -52,9 +59,9 @@ if(BUILD_TESTING AND QBRIDGE_BUILD_TESTS)
   add_executable(qbridge-tests
     tests/test_main.cpp
     tests/test_protocol.cpp
+    src/protocol.cpp
   )
-  target_include_directories(qbridge-tests PRIVATE src tests)
-  target_link_libraries(qbridge-tests PRIVATE QBridge::qbridge)
+  target_include_directories(qbridge-tests PRIVATE include src tests)
   add_test(NAME qbridge-tests COMMAND qbridge-tests)
 endif()
 
