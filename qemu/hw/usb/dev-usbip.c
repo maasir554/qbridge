@@ -67,6 +67,7 @@ struct USBIPRequest {
     int value;
     int index;
     bool control;
+    size_t bulk_chunk_size;
     bool iso_prefetch;
     bool completed;
     uint32_t iso_next;
@@ -365,6 +366,64 @@ static void usb_ip_apply_control_state(USBIPRequest *r)
     }
 }
 
+/* usbipd-win exports its Windows device instance ID in the USB/IP path.
+ * Select the limit using the speed reported by the exporter.
+ */
+static size_t usb_ip_bulk_read_size(const qb_device_info *info,
+                                    const USBPacket *packet, size_t length)
+{
+    size_t limit;
+
+    if (!info || g_ascii_strncasecmp(info->path, "USB\\", 4) ||
+        packet->ep->pipeline || packet->stream ||
+        packet->ep->max_packet_size <= 0) {
+        return length;
+    }
+    switch (info->speed) {
+    case QB_SPEED_FULL:
+    case QB_SPEED_HIGH:
+        limit = 4u * 1024 * 1024;
+        break;
+    case QB_SPEED_SUPER:
+    case QB_SPEED_SUPER_PLUS:
+        limit = 32u * 1024 * 1024;
+        break;
+    default:
+        return length;
+    }
+    /* An intermediate chunk must end on a full packet boundary. */
+    return length > limit ? limit - limit % packet->ep->max_packet_size : length;
+}
+
+static bool usb_ip_continue_bulk_read(USBIPRequest *r, USBPacket *packet)
+{
+    USBIPDevice *s = r->owner;
+    size_t actual = r->completion.actual_length;
+    size_t remaining;
+
+    packet->status = usb_ip_status(r->completion.status);
+    if (actual) {
+        usb_packet_copy(packet, r->buffer, actual);
+    }
+    remaining = usb_packet_size(packet) - packet->actual_length;
+    if (packet->status == USB_RET_SUCCESS &&
+        actual == r->transfer.length && remaining) {
+        qb_result result;
+
+        r->transfer.length = MIN(r->bulk_chunk_size, remaining);
+        qemu_mutex_lock(&s->lock);
+        r->completed = false;
+        qemu_mutex_unlock(&s->lock);
+        result = qb_session_submit(s->session, &r->transfer, &r->id);
+        if (result == QB_OK) {
+            packet->status = USB_RET_ASYNC;
+            return true;
+        }
+        packet->status = usb_ip_status(result);
+    }
+    return false;
+}
+
 static void usb_ip_request_bh(void *opaque)
 {
     USBIPRequest *r = opaque;
@@ -374,10 +433,18 @@ static void usb_ip_request_bh(void *opaque)
 
     qemu_mutex_lock(&s->lock);
     packet = r->packet;
+    qemu_mutex_unlock(&s->lock);
+
+    if (packet && r->bulk_chunk_size && usb_ip_continue_bulk_read(r, packet)) {
+        return;
+    }
+    qemu_mutex_lock(&s->lock);
     QTAILQ_REMOVE(&s->requests, r, next);
     qemu_mutex_unlock(&s->lock);
 
-    if (packet) {
+    if (packet && r->bulk_chunk_size) {
+        usb_packet_complete(dev, packet);
+    } else if (packet) {
         usb_ip_quirk_uvc_payload(r);
         packet->status = usb_ip_status(r->completion.status);
         packet->actual_length = 0;
@@ -674,8 +741,9 @@ static void usb_ip_handle_control(USBDevice *dev, USBPacket *packet,
     r->index = index;
     r->control_data = data;
     r->transfer.type = QB_TRANSFER_CONTROL;
-    r->transfer.direction = (request & USB_DIR_IN) ? QB_DIR_IN : QB_DIR_OUT;
     r->transfer.setup[0] = request >> 8;
+    r->transfer.direction = (r->transfer.setup[0] & USB_DIR_IN)
+                          ? QB_DIR_IN : QB_DIR_OUT;
     r->transfer.setup[1] = request;
     r->transfer.setup[2] = value;
     r->transfer.setup[3] = value >> 8;
@@ -697,6 +765,7 @@ static void usb_ip_handle_data(USBDevice *dev, USBPacket *packet)
     const size_t length = usb_packet_size(packet);
     const int type = usb_ep_get_type(dev, packet->pid, packet->ep->nr);
     const unsigned dir = packet->pid == USB_TOKEN_IN ? 1 : 0;
+    size_t submit_size = length;
 
     if (!s->session || !qb_session_connected(s->session)) {
         packet->status = USB_RET_NODEV;
@@ -724,7 +793,15 @@ static void usb_ip_handle_data(USBDevice *dev, USBPacket *packet)
         packet->actual_length = length;
         return;
     }
-    r = usb_ip_request_new(s, packet, length, false);
+    if (type == USB_ENDPOINT_XFER_BULK && dir) {
+        submit_size = usb_ip_bulk_read_size(qb_session_device(s->session),
+                                            packet, length);
+    }
+    r = usb_ip_request_new(s, packet, submit_size, false);
+    if (submit_size < length) {
+        r->bulk_chunk_size = submit_size;
+        packet->actual_length = 0;
+    }
     r->transfer.type = type;
     r->transfer.direction = dir ? QB_DIR_IN : QB_DIR_OUT;
     r->transfer.endpoint = packet->ep->nr;
